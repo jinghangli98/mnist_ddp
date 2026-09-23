@@ -1,0 +1,188 @@
+diff -ru a/tinyddp/data.py b/tinyddp/data.py
+--- a/tinyddp/data.py	2026-09-23 01:23:25.625218914 -0400
++++ b/tinyddp/data.py	2026-09-23 01:23:25.609218595 -0400
+@@ -1,5 +1,5 @@
+ import torch
+-from torch.utils.data import DataLoader, Dataset, DistributedSampler
++from torch.utils.data import DataLoader, Dataset, DistributedSampler, Sampler
+ 
+ from .dist_utils import get_rank, get_world_size
+ 
+@@ -24,13 +24,29 @@
+         return self.x[i], self.y[i]
+ 
+ 
++class UnpaddedDistributedSampler(Sampler):
++    """Rank r gets indices r, r+W, r+2W, ... — no shuffling, no padding, so the shards
++    are an exact partition (sizes differ by at most one)."""
++
++    def __init__(self, dataset, num_replicas, rank):
++        self.indices = range(rank, len(dataset), num_replicas)
++
++    def __iter__(self):
++        return iter(self.indices)
++
++    def __len__(self):
++        return len(self.indices)
++
++
+ def shard(dataset, shuffle, seed=0):
+     """A sampler that gives this rank its 1/world_size slice of `dataset`.
+ 
+     Explicit num_replicas / rank so it also works single-process (world size 1).
+     """
+-    return DistributedSampler(dataset, num_replicas=get_world_size(), rank=get_rank(),
+-                              shuffle=shuffle, seed=seed)
++    if shuffle:
++        return DistributedSampler(dataset, num_replicas=get_world_size(), rank=get_rank(),
++                                  shuffle=True, seed=seed)
++    return UnpaddedDistributedSampler(dataset, get_world_size(), get_rank())
+ 
+ 
+ def set_epoch(loader, epoch):
+@@ -42,6 +58,7 @@
+ def build_loaders(cfg):
+     train_ds = TeacherDataset(cfg.n_train, cfg.in_dim, cfg.n_classes, "train")
+     val_ds = TeacherDataset(cfg.n_val, cfg.in_dim, cfg.n_classes, "val")
+-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, drop_last=True)
++    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, drop_last=True,
++                              sampler=shard(train_ds, shuffle=True, seed=cfg.seed))
+     val_loader = DataLoader(val_ds, batch_size=64, sampler=shard(val_ds, shuffle=False))
+     return train_loader, val_loader
+diff -ru a/tinyddp/model.py b/tinyddp/model.py
+--- a/tinyddp/model.py	2026-09-23 01:23:25.625218914 -0400
++++ b/tinyddp/model.py	2026-09-23 01:23:25.609218595 -0400
+@@ -13,19 +13,25 @@
+ 
+ 
+ class MLP(nn.Module):
+-    """Residual MLP classifier with an auxiliary head on the embedding (deep supervision)."""
++    """Residual MLP classifier with an optional auxiliary head on the embedding."""
+ 
+-    def __init__(self, in_dim, hidden, depth, n_classes):
++    def __init__(self, in_dim, hidden, depth, n_classes, use_aux):
+         super().__init__()
+         self.embed = nn.Linear(in_dim, hidden)
+         self.blocks = nn.Sequential(*[Block(hidden) for _ in range(depth)])
+         self.head = nn.Linear(hidden, n_classes)
+-        self.aux_head = nn.Linear(hidden, n_classes)
++        self.aux_head = nn.Linear(hidden, n_classes) if use_aux else None
+ 
+     def forward(self, x):
+         h = self.embed(x)
+-        return self.head(self.blocks(h)), self.aux_head(h)
++        aux = self.aux_head(h) if self.aux_head is not None else None
++        return self.head(self.blocks(h)), aux
+ 
+ 
+ def build_model(cfg):
+-    return MLP(cfg.in_dim, cfg.hidden, cfg.depth, cfg.n_classes)
++    return MLP(cfg.in_dim, cfg.hidden, cfg.depth, cfg.n_classes, use_aux=cfg.aux_weight > 0)
++
++
++def unwrap(model):
++    """The underlying module, whether or not `model` is wrapped in DDP."""
++    return model.module if hasattr(model, "module") else model
+Only in b/tinyddp: __pycache__
+diff -ru a/tinyddp/trainer.py b/tinyddp/trainer.py
+--- a/tinyddp/trainer.py	2026-09-23 01:23:25.625218914 -0400
++++ b/tinyddp/trainer.py	2026-09-23 01:23:25.609218595 -0400
+@@ -1,3 +1,4 @@
++import contextlib
+ import json
+ import os
+ 
+@@ -7,6 +8,7 @@
+ 
+ from .data import set_epoch
+ from .dist_utils import get_world_size, global_batch_size, is_distributed, is_main, log
++from .model import unwrap
+ 
+ 
+ class Trainer:
+@@ -28,9 +30,7 @@
+     def loss_fn(self, batch):
+         x, y = (t.to(self.device) for t in batch)
+         logits, aux = self.model(x)
+-        # Per-sample losses normalised by the *global* batch, so the effective learning
+-        # rate does not depend on world size or accumulation.
+-        loss = F.cross_entropy(logits, y, reduction="sum") / global_batch_size(self.cfg)
++        loss = F.cross_entropy(logits, y)
+         if self.cfg.aux_weight > 0:
+             loss = loss + self.cfg.aux_weight * F.cross_entropy(aux, y)
+         return loss
+@@ -42,10 +42,17 @@
+         self.opt.zero_grad(set_to_none=True)
+         running = torch.zeros((), device=self.device)
+         for i, batch in enumerate(self.train_loader):
+-            loss = self.loss_fn(batch)
+-            loss.backward()  # grads accumulate across micro-batches
++            is_last_micro = (i + 1) % accum == 0
++            # DDP all-reduces inside backward(); skip it on non-final micro-batches.
++            # no_sync() must enclose the *forward* too: DDP decides during forward
++            # whether the coming backward will reduce.
++            sync_ctx = contextlib.nullcontext() if is_last_micro or not is_distributed() \
++                else self.model.no_sync()
++            with sync_ctx:
++                loss = self.loss_fn(batch) / accum
++                loss.backward()
+             running += loss.detach()
+-            if (i + 1) % accum != 0:
++            if not is_last_micro:
+                 continue
+             self.opt.step()
+             self.opt.zero_grad(set_to_none=True)
+@@ -62,20 +69,21 @@
+     @torch.no_grad()
+     def evaluate(self):
+         self.model.eval()
+-        correct = torch.zeros((), device=self.device)
++        stats = torch.zeros(2, device=self.device)  # [correct, total] on this rank's shard
+         for x, y in self.val_loader:
+             x, y = x.to(self.device), y.to(self.device)
+             logits, _ = self.model(x)
+-            correct += (logits.argmax(dim=1) == y).sum()
++            stats[0] += (logits.argmax(dim=1) == y).sum()
++            stats[1] += y.numel()
+         if is_distributed():
+-            dist.reduce(correct, dst=0)  # rank 0 gets the total over all shards
+-        return correct.item() / len(self.val_loader.dataset)
++            dist.all_reduce(stats)  # every rank needs the global number: it drives control flow
++        return (stats[0] / stats[1]).item()
+ 
+     def save_checkpoint(self, epoch, val_acc):
+         os.makedirs(self.cfg.run_dir, exist_ok=True)
+         torch.save(
+             {
+-                "model": self.model.state_dict(),
++                "model": unwrap(self.model).state_dict(),  # no "module." prefix
+                 "optimizer": self.opt.state_dict(),
+                 "epoch": epoch,
+                 "global_step": self.global_step,
+diff -ru a/train.py b/train.py
+--- a/train.py	2026-09-23 01:23:25.625218914 -0400
++++ b/train.py	2026-09-23 01:23:25.609218595 -0400
+@@ -8,7 +8,7 @@
+ 
+ from tinyddp.config import Config
+ from tinyddp.data import build_loaders
+-from tinyddp.dist_utils import cleanup, is_distributed, is_main, setup
++from tinyddp.dist_utils import cleanup, is_distributed, setup
+ from tinyddp.model import build_model
+ from tinyddp.trainer import Trainer
+ 
+@@ -22,10 +22,10 @@
+     optimizer = torch.optim.SGD(model.parameters(), lr=cfg.lr, momentum=cfg.momentum)
+ 
+     state = {}
+-    if cfg.resume and is_main():
+-        # Only rank 0 touches the filesystem; DDP broadcasts the weights when it wraps
+-        # the model below, so the other ranks pick them up from there.
+-        state = torch.load(cfg.resume)
++    if cfg.resume:
++        # Every rank restores everything: DDP only broadcasts the *weights* (and only
++        # once, at construction); optimizer state and the epoch counter are on us.
++        state = torch.load(cfg.resume, map_location=device)
+         model.load_state_dict(state["model"])
+         optimizer.load_state_dict(state["optimizer"])
+ 
