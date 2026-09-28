@@ -11,6 +11,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 import torch.distributed as dist
 import os
+import math
+import contextlib
 
 
 def ddp_setup(rank, world_size):
@@ -53,6 +55,8 @@ def parse_args():
     p.add_argument('--lr', type=float, default=3e-4, )
     p.add_argument('--num_workers', type=int, default=8, )
     p.add_argument('--eval_freq', type=int, default=4,)
+    p.add_argument('--grad_accum', type=int, default=1,
+                   help='number of micro-batches to accumulate before an optimizer step')
     
 
     return p.parse_args()
@@ -73,19 +77,29 @@ def getloader(args):
     
     return train_loader, test_loader, train_sampler, test_sampler
 
-def train(model, train_loader, optimizer, epoch, rank, scheduler, log_interval=100):
+def train(model, train_loader, optimizer, epoch, rank, scheduler, grad_accum=1, log_interval=100):
     model.train()
+    num_batches = len(train_loader)
+    optimizer.zero_grad()
     for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(rank), target.to(rank)
-        optimizer.zero_grad()
-        output = model(data)
-        loss = torch.nn.functional.nll_loss(output, target)
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
-        
+        # step on every grad_accum-th micro-batch, and on the last one so leftover grads are not dropped
+        is_step = (batch_idx + 1) % grad_accum == 0 or (batch_idx + 1) == num_batches
+
+        # skip the all-reduce on micro-batches that don't step; DDP syncs on the stepping one
+        sync_ctx = model.no_sync() if not is_step else contextlib.nullcontext()
+        with sync_ctx:
+            output = model(data)
+            loss = torch.nn.functional.nll_loss(output, target) / grad_accum
+            loss.backward()
+
+        if is_step:
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+
         if rank == 0 and batch_idx % log_interval == 0:
-            print(f'Epoch: {epoch} [{batch_idx}/{len(train_loader)}]'
+            print(f'Epoch: {epoch} [{batch_idx}/{num_batches}]'
                   f'loss {loss.item():.4f} lr {scheduler.get_last_lr()[0]:.2e}')
     
 def test(model, test_loader, epoch, rank):
@@ -117,7 +131,9 @@ def main(rank, world_size, args):
     model = DDP(model, device_ids=[rank])
     optimizer = torch.optim.Adam(model.parameters(), lr = args.lr)
     
-    warmup_steps = int(0.05 * args.epochs * len(train_loader))
+    steps_per_epoch = math.ceil(len(train_loader) / args.grad_accum)
+    total_steps = args.epochs * steps_per_epoch
+    warmup_steps = int(0.05 * total_steps)
     warmup = LinearLR(
         optimizer,
         start_factor = 0.01,
@@ -127,7 +143,7 @@ def main(rank, world_size, args):
     
     cosine = CosineAnnealingLR(
         optimizer,
-        T_max=args.epochs*len(train_loader) - warmup_steps,
+        T_max=total_steps - warmup_steps,
         eta_min = 3e-6,
     )
     
@@ -141,7 +157,7 @@ def main(rank, world_size, args):
         print('Training starts here.......')
     for epoch in range(args.epochs):
         train_sampler.set_epoch(epoch)
-        train(model, train_loader, optimizer, epoch, rank, scheduler)
+        train(model, train_loader, optimizer, epoch, rank, scheduler, grad_accum=args.grad_accum)
         if epoch % args.eval_freq == 0:
             test(model, test_loader, epoch, rank)
     
